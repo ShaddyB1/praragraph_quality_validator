@@ -11,7 +11,7 @@ from transformers import BertTokenizer, BertModel
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix
 
-# Load spaCy model
+
 nlp = spacy.load("en_core_web_sm")
 
 class ParagraphQualityClassifier(nn.Module):
@@ -32,16 +32,16 @@ class ParagraphQualityClassifier(nn.Module):
 def extract_linguistic_features(paragraph, max_features=100):
     doc = nlp(paragraph)
     
-    # Grammar check : count of different POS tags
+   
     pos_counts = {pos: 0 for pos in nlp.pipe_labels['tagger']}
     for token in doc:
         pos_counts[token.pos_] = pos_counts.get(token.pos_, 0) + 1
     
-    # count transition words
+  
     transition_words = set(['however', 'therefore', 'thus', 'consequently', 'furthermore'])
     coherence_score = sum(1 for token in doc if token.text.lower() in transition_words)
     
-    # Convert to tensor 
+  
     features = torch.tensor([*pos_counts.values(), coherence_score], dtype=torch.float)
     if len(features) < max_features:
         features = torch.cat([features, torch.zeros(max_features - len(features))])
@@ -228,14 +228,14 @@ if __name__ == "__main__":
         temp_paragraphs, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
     )
     
-    max_features = 100  # Set this to a value that works for your data
+    max_features = 100  
     
     # Create datasets
     train_dataset = ParagraphDataset(train_paragraphs, train_labels, tokenizer, max_features)
     val_dataset = ParagraphDataset(val_paragraphs, val_labels, tokenizer, max_features)
     test_dataset = ParagraphDataset(test_paragraphs, test_labels, tokenizer, max_features)
     
-    # Optimize hyperparameters
+   
     best_params = optimize_hyperparameters(train_dataset, val_dataset)
     
     # Create dataloaders
@@ -243,14 +243,13 @@ if __name__ == "__main__":
     val_dataloader = DataLoader(val_dataset, batch_size=best_params['batch_size'])
     test_dataloader = DataLoader(test_dataset, batch_size=best_params['batch_size'])
     
-    # To Train model
+  
     model = ParagraphQualityClassifier(max_features)
     train_losses, val_losses, val_accuracies = train_model(model, train_dataloader, val_dataloader, epochs=5, lr=best_params['lr'])
     
-    # Plot learning curves
+ 
     plot_learning_curves(train_losses, val_losses, val_accuracies)
-    
-    # Validate on test set
+
     model.eval()
     y_true = []
     y_pred = []

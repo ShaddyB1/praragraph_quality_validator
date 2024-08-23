@@ -2,135 +2,82 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-import optuna
-import spacy
-import logging
-import matplotlib.pyplot as plt
-import seaborn as sns
 from transformers import BertTokenizer, BertModel
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix
+import numpy as np
+import spacy
+import re
 
 
 nlp = spacy.load("en_core_web_sm")
 
+class ParagraphFeatures:
+    def __init__(self, text):
+        self.text = text
+        self.doc = nlp(text)
+    
+    def get_sentence_count(self):
+        return len(list(self.doc.sents))
+    
+    def get_word_count(self):
+        return len([token for token in self.doc if not token.is_punct])
+    
+    def get_average_sentence_length(self):
+        sentences = list(self.doc.sents)
+        if not sentences:
+            return 0
+        return sum(len([token for token in sent if not token.is_punct]) for sent in sentences) / len(sentences)
+    
+    def get_coherence_score(self):
+        sentences = list(self.doc.sents)
+        if len(sentences) < 2:
+            return 0
+        
+        coherence_scores = []
+        for i in range(len(sentences) - 1):
+            current_sent = set(token.lemma_ for token in sentences[i] if token.is_alpha)
+            next_sent = set(token.lemma_ for token in sentences[i+1] if token.is_alpha)
+            overlap = len(current_sent.intersection(next_sent))
+            coherence_scores.append(overlap / max(len(current_sent), len(next_sent)))
+        
+        return sum(coherence_scores) / len(coherence_scores)
+    
+    def has_topic_sentence(self):
+        first_sentence = next(self.doc.sents)
+        return any(token.dep_ == "nsubj" for token in first_sentence)
+    
+    def get_features(self):
+        return torch.tensor([
+            self.get_sentence_count(),
+            self.get_word_count(),
+            self.get_average_sentence_length(),
+            self.get_coherence_score(),
+            int(self.has_topic_sentence())
+        ], dtype=torch.float)
+
 class ParagraphQualityClassifier(nn.Module):
-    def __init__(self, max_features=100):
+    def __init__(self):
         super(ParagraphQualityClassifier, self).__init__()
         self.bert = BertModel.from_pretrained('bert-base-uncased')
         self.dropout = nn.Dropout(0.1)
-        self.fc1 = nn.Linear(768, 128)
-        self.fc2 = nn.Linear(128 + max_features, 2)
+        self.fc1 = nn.Linear(768 + 5, 256)  
+        self.fc2 = nn.Linear(256, 2)
+        self.relu = nn.ReLU()
 
-    def forward(self, input_ids, attention_mask, linguistic_features):
+    def forward(self, input_ids, attention_mask, features):
         _, pooled_output = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=False)
-        dropout_output = self.dropout(pooled_output)
-        bert_output = self.fc1(dropout_output)
-        combined = torch.cat((bert_output, linguistic_features), dim=1)
-        return self.fc2(combined)
-
-def extract_linguistic_features(paragraph, max_features=100):
-    doc = nlp(paragraph)
-    
-   
-    pos_counts = {pos: 0 for pos in nlp.pipe_labels['tagger']}
-    for token in doc:
-        pos_counts[token.pos_] = pos_counts.get(token.pos_, 0) + 1
-    
-  
-    transition_words = set(['however', 'therefore', 'thus', 'consequently', 'furthermore'])
-    coherence_score = sum(1 for token in doc if token.text.lower() in transition_words)
-    
-  
-    features = torch.tensor([*pos_counts.values(), coherence_score], dtype=torch.float)
-    if len(features) < max_features:
-        features = torch.cat([features, torch.zeros(max_features - len(features))])
-    else:
-        features = features[:max_features]
-    
-    return features
-
-def train_model(model, train_dataloader, val_dataloader, epochs=5, lr=2e-5):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    train_losses = []
-    val_losses = []
-    val_accuracies = []
-    
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for batch in train_dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            linguistic_features = batch['linguistic_features'].to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(input_ids, attention_mask, linguistic_features)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in val_dataloader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                linguistic_features = batch['linguistic_features'].to(device)
-                
-                outputs = model(input_ids, attention_mask, linguistic_features)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-        
-        train_losses.append(train_loss / len(train_dataloader))
-        val_losses.append(val_loss / len(val_dataloader))
-        val_accuracies.append(100 * correct / total)
-        
-        print(f'Epoch {epoch+1}/{epochs}')
-        print(f'Train Loss: {train_losses[-1]:.4f}')
-        print(f'Validation Loss: {val_losses[-1]:.4f}')
-        print(f'Validation Accuracy: {val_accuracies[-1]:.2f}%')
-    
-    return train_losses, val_losses, val_accuracies
-
-def validate_paragraph(model, tokenizer, paragraph, max_features=100):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-    
-    inputs = tokenizer(paragraph, return_tensors='pt', truncation=True, padding=True, max_length=512)
-    input_ids = inputs['input_ids'].to(device)
-    attention_mask = inputs['attention_mask'].to(device)
-    linguistic_features = extract_linguistic_features(paragraph, max_features).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        outputs = model(input_ids, attention_mask, linguistic_features)
-        _, predicted = torch.max(outputs, 1)
-    
-    return "High quality" if predicted.item() == 1 else "Low quality"
+        combined = torch.cat((pooled_output, features), dim=1)
+        x = self.dropout(combined)
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
 
 class ParagraphDataset(Dataset):
-    def __init__(self, paragraphs, labels, tokenizer, max_features=100):
+    def __init__(self, paragraphs, labels, tokenizer, max_length=128):
         self.paragraphs = paragraphs
         self.labels = labels
         self.tokenizer = tokenizer
-        self.max_features = max_features
+        self.max_length = max_length
 
     def __len__(self):
         return len(self.paragraphs)
@@ -138,137 +85,183 @@ class ParagraphDataset(Dataset):
     def __getitem__(self, idx):
         paragraph = self.paragraphs[idx]
         label = self.labels[idx]
-        
-        encoding = self.tokenizer(paragraph, return_tensors='pt', truncation=True, padding='max_length', max_length=512)
-        linguistic_features = extract_linguistic_features(paragraph, self.max_features)
-        
+
+        encoding = self.tokenizer.encode_plus(
+            paragraph,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+
+        features = ParagraphFeatures(paragraph).get_features()
+
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.long),
-            'linguistic_features': linguistic_features
+            'features': features,
+            'labels': torch.tensor(label, dtype=torch.long)
         }
+class ParagraphQualityScorer(nn.Module):
+    def __init__(self):
+        super(ParagraphQualityScorer, self).__init__()
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(768, 1)
+        self.sigmoid = nn.Sigmoid()
 
-def optimize_hyperparameters(train_dataset, val_dataset):
-    def objective(trial):
-        lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size)
-        
-        model = ParagraphQualityClassifier(max_features=100)
-        _, _, val_accuracies = train_model(model, train_loader, val_loader, epochs=3, lr=lr)
-        
-        return val_accuracies[-1]
+    def forward(self, input_ids, attention_mask):
+        _, pooled_output = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=False)
+        x = self.dropout(pooled_output)
+        x = self.fc(x)
+        return self.sigmoid(x)
 
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=10)  
-    
-    print('Best trial:')
-    trial = study.best_trial
-    print(f'Value: {trial.value}')
-    print('Params: ')
-    for key, value in trial.params.items():
-        print(f'    {key}: {value}')
-    
-    return trial.params
-
-def plot_learning_curves(train_losses, val_losses, val_accuracies):
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(val_accuracies, label='Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
-
-def plot_confusion_matrix(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.show()
-
-# Example usage:
-if __name__ == "__main__":
-    # example paragraphs
-    paragraphs = [
-        "This is a high-quality paragraph with good structure and coherence.",
-        "Poor paragraph no good writing here.",
-        "Another excellent paragraph demonstrating clear thoughts and proper grammar.",
-        "Bad paragraph structure confusing ideas.",
-        "Well-written paragraph with logical flow and proper use of transition words.",
-        "Lacking coherence and proper structure in this paragraph.",
-        "Clear and concise writing in this high-quality paragraph.",
-        "Grammatical errors and poor organization make this a low-quality paragraph.",
-        "Effective use of language and strong arguments in this paragraph.",
-        "Rambling and unfocused writing in this low-quality example."
-    ]
-    labels = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]  # 1 for high quality, 0 for low quality
-    
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    
-    # Split data
-    train_paragraphs, temp_paragraphs, train_labels, temp_labels = train_test_split(
-        paragraphs, labels, test_size=0.4, random_state=42, stratify=labels
-    )
-    val_paragraphs, test_paragraphs, val_labels, test_labels = train_test_split(
-        temp_paragraphs, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
-    )
-    
-    max_features = 100  
-    
-    # Create datasets
-    train_dataset = ParagraphDataset(train_paragraphs, train_labels, tokenizer, max_features)
-    val_dataset = ParagraphDataset(val_paragraphs, val_labels, tokenizer, max_features)
-    test_dataset = ParagraphDataset(test_paragraphs, test_labels, tokenizer, max_features)
-    
-   
-    best_params = optimize_hyperparameters(train_dataset, val_dataset)
-    
-    # Create dataloaders
-    train_dataloader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=best_params['batch_size'])
-    test_dataloader = DataLoader(test_dataset, batch_size=best_params['batch_size'])
-    
-  
-    model = ParagraphQualityClassifier(max_features)
-    train_losses, val_losses, val_accuracies = train_model(model, train_dataloader, val_dataloader, epochs=5, lr=best_params['lr'])
-    
- 
-    plot_learning_curves(train_losses, val_losses, val_accuracies)
-
-    model.eval()
-    y_true = []
-    y_pred = []
+def classify_paragraph(model, tokenizer, paragraph):
+    inputs = tokenizer(paragraph, return_tensors="pt", truncation=True, padding=True, max_length=512)
     with torch.no_grad():
-        for batch in test_dataloader:
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
-            labels = batch['labels']
-            linguistic_features = batch['linguistic_features']
-            
-            outputs = model(input_ids, attention_mask, linguistic_features)
-            _, predicted = torch.max(outputs, 1)
-            
-            y_true.extend(labels.tolist())
-            y_pred.extend(predicted.tolist())
+        score = model(inputs['input_ids'], inputs['attention_mask']).item()
     
-    plot_confusion_matrix(y_true, y_pred)
-    
-    # Example of using the model to validate a new paragraph
-    new_paragraph = "This is a new paragraph to validate. It demonstrates good writing skills."
-    result = validate_paragraph(model, tokenizer, new_paragraph, max_features)
-    print(f"The new paragraph is classified as: {result}")
+    if score < 0.33:
+        return f"Low Quality (Score: {score:.2f})"
+    elif score < 0.67:
+        return f"Medium Quality (Score: {score:.2f})"
+    else:
+        return f"High Quality (Score: {score:.2f})"
+        
+def train_model(model, train_loader, val_loader, epochs=10, lr=2e-5):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for batch in train_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            features = batch['features'].to(device)
+            labels = batch['labels'].to(device)
+
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask, features)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                features = batch['features'].to(device)
+                labels = batch['labels'].to(device)
+
+                outputs = model(input_ids, attention_mask, features)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        print(f'Epoch {epoch+1}/{epochs}')
+        print(f'Train Loss: {train_loss/len(train_loader):.4f}')
+        print(f'Validation Loss: {val_loss/len(val_loader):.4f}')
+        print(f'Validation Accuracy: {100 * correct / total:.2f}%')
+        print()
+
+    return model
+
+def main():
+   
+    paragraphs = [
+        "This is a well-structured paragraph with clear ideas and proper grammar. It contains multiple sentences that are coherent and related to a single topic. The sentences flow logically from one to the next, creating a unified whole.",
+        "Poor writing confusing ideas no structure. One sentence only.",
+        "The author presents a compelling argument with strong evidence and logical flow. The paragraph begins with a clear topic sentence, followed by supporting details and examples. It concludes with a sentence that reinforces the main idea.",
+        "Lacks coherence jumbled thoughts grammatical errors. Sentences don't connect. Ideas jump around. No clear topic or purpose.",
+        "A concise and informative paragraph that effectively communicates its main point. Although brief, it contains multiple sentences that work together to convey a single idea. The language is clear and precise.",
+        "Rambling sentences no clear topic unfocused writing. This text goes on and on without making a point. It's hard to follow because there's no central theme. The ideas are all over the place and don't connect well.",
+        "One",
+        "The",
+        "The quick brown fox jumps over the lazy dog.",
+        "This paragraph demonstrates excellent use of vocabulary and varied sentence structure. It begins with a strong topic sentence that introduces the main idea. The following sentences elaborate on this idea, providing specific details and examples. The paragraph concludes with a sentence that ties everything together, reinforcing the central theme.",
+        "Run on sentence with no punctuation or capitalization just a stream of consciousness that goes on and on without any clear breaks or pauses making it difficult to understand or follow the intended meaning if there even is one",
+        "Vague generalities without specific examples or supporting evidence. Some say things happen. Others disagree. It's complicated. No one really knows for sure.",
+        "This well-crafted paragraph showcases the author's command of language. It starts with an engaging topic sentence that captures the reader's attention. The subsequent sentences develop the main idea logically, using specific details and vivid language. The paragraph concludes with a thoughtful statement that leaves a lasting impression on the reader."
+    ]
+    labels = [1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1]  # 1 for proper paragraph, 0 for not a proper paragraph
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    train_paragraphs, val_paragraphs, train_labels, val_labels = train_test_split(
+        paragraphs, labels, test_size=0.2, random_state=42, stratify=labels
+    )
+
+    train_dataset = ParagraphDataset(train_paragraphs, train_labels, tokenizer)
+    val_dataset = ParagraphDataset(val_paragraphs, val_labels, tokenizer)
+
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=4)
+
+    model = ParagraphQualityClassifier()
+
+    trained_model = train_model(model, train_loader, val_loader, epochs=10)
+
+    print("Training completed.")
+
+    torch.save(trained_model.state_dict(), 'paragraph_structure_model.pth')
+    print("Model saved successfully.")
+
+    # Tests
+    test_paragraphs = [
+        "This is a well-written test paragraph to demonstrate the model's capability. It contains multiple sentences that are coherent and related to a single topic. The sentences flow logically, creating a unified whole.",
+        "Bad grammar no sense. One sentence only.",
+        "One",
+        "The quick brown fox jumps over the lazy dog.",
+        "This insightful analysis is supported by relevant examples and clear argumentation. The paragraph begins with a strong thesis statement, followed by several sentences that provide evidence and explanation. It concludes by reinforcing the main point, tying all the ideas together effectively."
+    ]
+
+    trained_model.eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    for test_paragraph in test_paragraphs:
+        test_encoding = tokenizer.encode_plus(
+            test_paragraph,
+            add_special_tokens=True,
+            max_length=128,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        test_features = ParagraphFeatures(test_paragraph).get_features().unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = trained_model(
+                test_encoding['input_ids'].to(device),
+                test_encoding['attention_mask'].to(device),
+                test_features.to(device)
+            )
+            probabilities = torch.softmax(outputs, dim=1)
+            predicted_class = torch.argmax(probabilities, dim=1).item()
+            confidence = probabilities[0][predicted_class].item()
+
+        quality = "Proper Paragraph" if predicted_class == 1 else "Not a Proper Paragraph"
+        print(f"\nTest Paragraph: {test_paragraph}")
+        print(f"Prediction: {quality}")
+        print(f"Confidence: {confidence:.2f}")
+
+if __name__ == "__main__":
+    main()
